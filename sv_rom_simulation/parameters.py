@@ -32,8 +32,14 @@ class OutflowBoundaryConditionType(object):
     RCR = "rcr"
     RESISTANCE = "resistance"
     CORONARY = "coronary"
-    SV_TO_ONED = {'rcrt.dat': RCR, 'resistance.dat': RESISTANCE, 'cort.dat': CORONARY}
-    ONED_TO_SV = {RCR: 'rcrt.dat', RESISTANCE: 'resistance.dat', CORONARY: 'cort.dat'}
+    # A prescribed flow at a centerline end other than the inlet: a second inflow. The
+    # centerlines are traced from one inlet, so every other cap is a centerline end whatever
+    # the flow does there, and a model with several inflows -- a Fontan, with the venae cavae
+    # and the hepatic veins all entering -- needs the other inflows prescribed at those ends.
+    # 0D only: svOneDSolver has no outlet flow condition to write it as.
+    FLOW = "flow"
+    SV_TO_ONED = {'rcrt.dat': RCR, 'resistance.dat': RESISTANCE, 'cort.dat': CORONARY, 'flow.dat': FLOW}
+    ONED_TO_SV = {RCR: 'rcrt.dat', RESISTANCE: 'resistance.dat', CORONARY: 'cort.dat', FLOW: 'flow.dat'}
 
 
 class MaterialModel(object):

@@ -298,7 +298,6 @@ def set_parameters(**kwargs):
         if os.path.dirname(params.inlet_face_input_file):
             logger.error("The inlet face input file '%s' should not have a full path." % params.inlet_face_input_file)
             return None
-        print(f' params.inlet_face_input_file: { params.inlet_face_input_file}')
         inlet_file = os.path.join(params.boundary_surfaces_dir, params.inlet_face_input_file)
         if not os.path.exists(inlet_file):
             logger.error("The inlet face input file '%s' was not found in the boundary surfaces diretory '%s'." % \
@@ -306,8 +305,10 @@ def set_parameters(**kwargs):
             return None
         logger.info("Inlet face input file: %s" % params.inlet_face_input_file)
 
-    if kwargs.get(Args.INLET_FACE_ID):
-        params.inlet_face_id = kwargs.get(Args.INLET_FACE_ID)
+    # Tested against None rather than for truth: a face id of 0 is an id.
+    if kwargs.get(Args.INLET_FACE_ID) is not None:
+        params.inlet_face_id = int(kwargs.get(Args.INLET_FACE_ID))
+        logger.info("Inlet face id: %d" % params.inlet_face_id)
 
     if kwargs.get(Args.LINEAR_MATERIAL_EHR):
         params.linear_material_ehr = float(kwargs.get(Args.LINEAR_MATERIAL_EHR))
@@ -456,8 +457,8 @@ def set_parameters(**kwargs):
         logger.error("Both compute centerlines and read centerlines are given.")
         return None
 
-    if params.compute_centerlines and not params.inlet_face_input_file:
-        logger.error("An inlet face file must be given when computing centerlines.")
+    if params.compute_centerlines and not params.inlet_face_input_file and params.inlet_face_id is None:
+        logger.error("An inlet face file or face id must be given when computing centerlines.")
         return None
 
     if params.wall_properties_input_file and not params.wall_properties_output_file:
@@ -469,9 +470,9 @@ def set_parameters(**kwargs):
             "If an outflow boundary condition type is given then an input data file for that type must also be given.")
         return None
 
-    if not params.outlet_face_names_file:
-        logger.error("No outlet face names file was given.")
-        return None
+    # No outlet face names file is not an error here: the face files in the boundary surfaces
+    # directory name the outlets too, by where each one is, and whether there are any is only
+    # known once they are read. Mesh.set_outlet_face_names says so if neither is there.
 
     # Uniform / Non-uniform BCs.
     if params.uniform_bc:
@@ -498,6 +499,13 @@ def read_centerlines(params):
     logger.info("   Number of points: %d ", centerlines.geometry.GetNumberOfPoints())
     logger.info("   Number of cells: %d ", centerlines.geometry.GetNumberOfCells())
     logger.info("   Number of arrays: %d", centerlines.geometry.GetCellData().GetNumberOfArrays())
+
+    # Centerlines read back are named the way computed ones are, by where their ends are, when
+    # the surface and its inlet are known: the order they were written in is no more a promise
+    # about which end is which vessel than the order they were computed in.
+    if params.surface_model and (params.inlet_face_id is not None or params.inlet_face_input_file):
+        caps = get_caps(read_surface(params.surface_model), params.boundary_surfaces_dir)
+        centerlines.name_outlets(caps, get_inlet_face_id(params, caps))
 
     return centerlines
 

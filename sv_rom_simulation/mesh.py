@@ -184,6 +184,10 @@ class Mesh(object):
         if not params.uniform_bc:
             self.set_variable_outflow_bcs(params)
 
+        if params.model_order == 1 and OutflowBoundaryConditionType.FLOW in (self.bc_type or {}).values():
+            raise RuntimeError("A flow prescribed at a centerline end is written for svZeroDSolver only: "
+                               "svOneDSolver has no outlet flow condition to write it as.")
+
         if params.inflow_input_file:
             read_inflow_file(self, params)
 
@@ -216,8 +220,12 @@ class Mesh(object):
         """
         if self.centerlines_outlet_face_names is not None:
             outlet_face_names = self.centerlines_outlet_face_names
-        else:
+        elif params.outlet_face_names_file:
             outlet_face_names = read_outlet_face_names(self, params)
+        else:
+            raise RuntimeError("No outlet face names: give the boundary surfaces directory the faces "
+                               "were written to, so that each centerline end can be matched to its "
+                               "face, or an outlet face names file listing them in centerline order.")
 
         # Create a map between outlet face name and path ID.
         self.outlet_face_names_index = OrderedDict()
@@ -246,9 +254,16 @@ class Mesh(object):
             self.logger.error('Error while reading variable outflow boundary conditions')
             raise RuntimeError(str(e))
 
-        if len(self.bc_map) != len(self.outlet_face_names):
-            msg = "The number of BC values %d do not match the number of outlets %d." % (
-                len(self.bc_map), len(self.outlet_face_names))
+        # By name rather than by count: one misspelt face and one face left out are the same
+        # count, and then the first anyone hears of it is a KeyError writing the solver file.
+        missing = [name for name in self.outlet_face_names if name not in self.bc_map]
+        unknown = sorted(set(self.bc_map) - set(self.outlet_face_names))
+        if missing or unknown:
+            msg = "The boundary conditions do not match the outlets."
+            if missing:
+                msg += " No boundary condition for: %s." % ", ".join(missing)
+            if unknown:
+                msg += " Boundary conditions for faces that are not outlets: %s." % ", ".join(unknown)
             raise RuntimeError(msg)
 
         for s, t in self.bc_type.items():
@@ -311,7 +326,7 @@ class Mesh(object):
         self.discretize_branches(params)
 
         # step 2: create connectivity
-        self.discretize_bifurcations()
+        self.discretize_bifurcations(params)
 
     def discretize_branches(self, params):
         """
@@ -356,7 +371,10 @@ class Mesh(object):
             self.cell_data[br_name][br] = np.ones(num_seg) * br
             self.cell_data['length'][br] = params.lcoef * length * np.diff(sample_1d)
             self.cell_data['curv'][br] = interp1d(cell_centers, sample_1d, r_curv / params.lcoef)
-            self.cell_data['stenosis'][br] = f_sten
+            # The stenosis factor goes as one over an area squared, and get_sampling works it out
+            # from the centerline's own areas, so it is in the model's units until scaled here. A
+            # model in mm otherwise came out with stenosis coefficients 10^4 too small.
+            self.cell_data['stenosis'][br] = f_sten / params.Acoef ** 2
             self.cell_data['1d_seg'][br] = seg_num_1d
             self.point_data['id'][br] = np.arange(num_seg + 1) + point_ids_offset
             self.point_data[br_name][br] = np.ones(num_seg + 1) * br
@@ -513,7 +531,7 @@ class Mesh(object):
         # calculate path length
         return np.sum(np.linalg.norm(np.diff(points[point_ids], axis=0), axis=1))
 
-    def discretize_bifurcations(self):
+    def discretize_bifurcations(self, params):
         """
         Create refined sub-segment connectivity
         """
@@ -586,29 +604,38 @@ class Mesh(object):
                     tangent_out /= np.linalg.norm(tangent_out)
                     junction['tangents'] += [tangent_out.tolist()]
                     junction['areas'] += [self.cell_data['area'][br][0][0]]
-                    junction['lengths'] += [self.get_junction_length(br)]
+                    # Measured along the centerline's own points, so in the model's units until
+                    # scaled -- the areas beside it already are.
+                    junction['lengths'] += [params.lcoef * self.get_junction_length(br)]
                 self.junctions[i] = junction
 
     def get_outlet_branches(self):
         """
         Get list of branches connected to outlets
         """
-        # branch ids
-        br_id = self.get_point_data(self.PointDataFields.BRANCH)
-        bf_id = self.get_point_data(self.PointDataFields.BIFURCATION)
+        return [branch for branch, _point in outlet_end_points(self.centerline)]
 
-        # global node id
-        gid = self.get_point_data(self.PointDataFields.NODEID)
 
-        # outlet points are only connected to one cell (skip inlet point)
-        ids = vtkIdList()
-        outlets = []
-        for p in range(self.centerline.GetNumberOfPoints()):
-            self.centerline.GetPointCells(p, ids)
-            if ids.GetNumberOfIds() == 1 and gid[p] != 0:
-                assert br_id[p] != -1, 'bifurcation ' + str(bf_id[p]) + ' is connected to an outlet'
-                outlets += [br_id[p]]
-        return outlets
+def outlet_end_points(centerline):
+    """ The centerline's outlet ends, as (BranchId, point id) in the order the outlets are numbered.
+
+    An outlet end is a point of only one cell that is not the inlet's (GlobalNodeId 0). This is
+    the order Mesh.terminal is built in and so the order the outlet face names are paired with,
+    which is why it is a function of its own: the centerlines name their outlets by it too.
+    """
+    br_id = v2n(centerline.GetPointData().GetArray(Mesh.PointDataFields.BRANCH))
+    bf_id = v2n(centerline.GetPointData().GetArray(Mesh.PointDataFields.BIFURCATION))
+    gid = v2n(centerline.GetPointData().GetArray(Mesh.PointDataFields.NODEID))
+
+    # outlet points are only connected to one cell (skip inlet point)
+    ids = vtkIdList()
+    outlets = []
+    for p in range(centerline.GetNumberOfPoints()):
+        centerline.GetPointCells(p, ids)
+        if ids.GetNumberOfIds() == 1 and gid[p] != 0:
+            assert br_id[p] != -1, 'bifurcation ' + str(bf_id[p]) + ' is connected to an outlet'
+            outlets += [(br_id[p], p)]
+    return outlets
 
 
 def find_stenoses(area, path, params):
@@ -628,6 +655,18 @@ def find_stenoses(area, path, params):
     elif len(a_0) < len(a_s):
         a_s = a_s[1:]
         i_max = i_max[1:]
+
+    # The truncation above assumes minima and maxima alternate, so that their counts differ by
+    # one at most. A plateau breaks that -- argrelextrema's strict comparison skips it -- and a
+    # section area sampled off a faceted surface has plateaus, so the two can differ by more and
+    # the factor below failed to broadcast. Then each minimum is paired with the next maximum
+    # along the branch, which is the pairing the truncation was arriving at.
+    if len(a_0) != len(a_s):
+        maxima = argrelextrema(area, np.greater)[0]
+        i_min = np.array([i for i in argrelextrema(area, np.less)[0] if np.any(maxima > i)], dtype=int)
+        i_max = np.array([maxima[maxima > i][0] for i in i_min], dtype=int)
+        a_0 = area[i_min]
+        a_s = area[i_max]
 
     # stenosis factor
     f_sten = 1 / a_0 ** 2 * (a_0 / a_s - 1) ** 2

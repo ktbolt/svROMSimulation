@@ -36,6 +36,17 @@ import numpy as np
 from sv_rom_simulation.parameters import OutflowBoundaryConditionType
 
 
+def outlet_bc_name(bc_type, face_name):
+    """ The name an outlet's boundary condition is written under: its type and its face.
+
+    The face rather than its position in the outlet list, because the name is what every
+    result comes back labelled with -- svZeroDSolver's output, svZeroDVisualization, a 3D
+    coupling block -- and 'RCR_14' says nothing about which vessel it is without the list
+    beside it to look it up in.
+    """
+    return bc_type.upper() + '_' + face_name
+
+
 def write_0d_solver_file(mesh, params, model):
     """
     Generate 0d solver input file (.json)
@@ -53,8 +64,12 @@ def write_0d_solver_file(mesh, params, model):
     dt = params.time_step
     n_step = params.num_time_steps
     t_cycle = mesh.inflow_data[-1][0]
-    inp['simulation_parameters']['number_of_time_pts_per_cardiac_cycle'] = int(t_cycle / dt)
-    inp['simulation_parameters']['number_of_cardiac_cycles'] = int(n_step / t_cycle * dt) + 1
+    check_flow_periods(mesh, t_cycle)
+    # Rounded rather than truncated: a time step given as the period over a whole number of
+    # points does not divide it exactly in floating point, and truncating 99.99999 lost a
+    # point per cycle and, through the second line, a whole cycle.
+    inp['simulation_parameters']['number_of_time_pts_per_cardiac_cycle'] = int(round(t_cycle / dt))
+    inp['simulation_parameters']['number_of_cardiac_cycles'] = int(round(n_step / t_cycle * dt)) + 1
 
     # fluid
     inp['simulation_parameters']['density'] = params.density
@@ -77,7 +92,7 @@ def write_0d_solver_file(mesh, params, model):
             # outlet bc
             if j in mesh.terminal:
                 bc_name = list(mesh.outlet_face_names_index.keys())[mesh.terminal.index(j)]
-                bc_str = mesh.bc_type[bc_name].upper() + '_' + str(mesh.outlet_face_names_index[bc_name])
+                bc_str = outlet_bc_name(mesh.bc_type[bc_name], bc_name)
                 vessel['boundary_conditions'] = {'outlet': bc_str}
             inp['vessels'] += [vessel]
 
@@ -112,7 +127,7 @@ def write_0d_solver_file(mesh, params, model):
     # outlet bcs
     for bc_name, i in mesh.outlet_face_names_index.items():
         bc_type = mesh.bc_type[bc_name]
-        bc_str = mesh.bc_type[bc_name].upper() + '_' + str(i)
+        bc_str = outlet_bc_name(bc_type, bc_name)
         bc_val = mesh.bc_map[bc_name]
 
         outflow = {'bc_name': bc_str,
@@ -131,9 +146,31 @@ def write_0d_solver_file(mesh, params, model):
                 outflow['bc_values'][name] = val
             outflow['bc_values']['t'] = bc_val['time']
             outflow['bc_values']['Pim'] = bc_val['pressure']
+        elif bc_type == OutflowBoundaryConditionType.FLOW:
+            # Negated: the file gives the flow into the model, and this condition is on a
+            # vessel's outlet, where svZeroDSolver counts flow leaving the vessel as positive.
+            # Written as it comes, an inflow would be drawn out of the model instead.
+            outflow['bc_values']['t'] = [float(t) for t in bc_val['time']]
+            outflow['bc_values']['Q'] = [-float(q) for q in bc_val['flow']]
         inp['boundary_conditions'] += [outflow]
 
     # write to file
     file_name = os.path.join(params.output_directory, params.solver_output_file)
     with open(file_name, 'w') as file:
         json.dump(inp, file, indent=4, sort_keys=True)
+
+
+def check_flow_periods(mesh, t_cycle):
+    """ Refuse prescribed flows whose period is not the inflow's.
+
+    The cardiac cycle is read off the inflow file alone, so a second inflow over a different
+    period would be sampled against the wrong cycle: svZeroDSolver repeats each waveform over
+    its own last time, and two different periods drift apart cycle by cycle.
+    """
+    for name, bc_type in (mesh.bc_type or {}).items():
+        if bc_type != OutflowBoundaryConditionType.FLOW:
+            continue
+        period = mesh.bc_map[name]['time'][-1]
+        if not np.isclose(period, t_cycle):
+            raise RuntimeError("The flow prescribed at '%s' has a period of %g s and the inflow one of %g s; "
+                               "every prescribed flow has to cover the same cardiac cycle." % (name, period, t_cycle))

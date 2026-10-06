@@ -64,23 +64,28 @@ def read_inflow_file(mesh, params):
         <timeN>  <flowN>
     """
     mesh.logger.info("Read inflow BC ...")
-    inflow_data = []
-    inflow_file = params.inflow_input_file
-
     try:
-        with open(inflow_file, "r") as ofile:
-            for line in ofile:
-                if line.strip() == '':
-                    continue
-                values = re.split("[, ]+", line.strip())
-                inflow_data.append(FlowData(time=float(values[0]), flow=float(values[1])))
-
+        mesh.inflow_data = read_flow_data(params.inflow_input_file)
     except Exception as e:
         msg = "The inflow file is in the wrong format, expecting space- or comma-separated value pairs.\n"
         mesh.logger.error(msg)
         raise RuntimeError(str(e))
 
-    mesh.inflow_data = inflow_data
+
+def read_flow_data(file_name):
+    """ Read time / flow pairs, space- or comma-separated, one pair per line.
+
+    The format of the inflow file, and of every flow file 'flow.dat' names, so that a
+    waveform written for one can be used as the other.
+    """
+    flow_data = []
+    with open(file_name, "r") as ofile:
+        for line in ofile:
+            if line.strip() == '':
+                continue
+            values = re.split("[, ]+", line.strip())
+            flow_data.append(FlowData(time=float(values[0]), flow=float(values[1])))
+    return flow_data
 
 
 def read_outlet_face_names(mesh, params):
@@ -540,6 +545,30 @@ def read_variable_outflow_bcs(params):
                         bc_type[face_name] = outflow_bc
                     if len(tmp) == 0:
                         break
+
+        elif outflow_bc == OutflowBoundaryConditionType.FLOW:
+            # One line per face: the face name and the file holding its waveform, in the
+            # inflow file's own format. A file named without a path is beside 'flow.dat'.
+            # The flow is positive *into* the model, as the inflow file's is: which way it
+            # goes at a centerline end is the 0D writer's business, not the user's.
+            with open(bc_file) as rfile:
+                for line in rfile:
+                    split = line.strip().split()
+                    if not split:
+                        continue
+                    if len(split) != 2:
+                        raise RuntimeError("The flow file '%s' is in the wrong format, expecting "
+                                           "face name / flow file pairs, not '%s'." % (bc_file, line.strip()))
+                    face_name, flow_file = split
+                    if not path.isabs(flow_file):
+                        flow_file = path.join(path.dirname(bc_file), flow_file)
+                    try:
+                        flow_data = read_flow_data(flow_file)
+                    except Exception as e:
+                        raise RuntimeError("Could not read the flow for '%s' from '%s': %s" % (face_name, flow_file, e))
+                    bc_map[face_name] = {'time': [value.time for value in flow_data],
+                                         'flow': [value.flow for value in flow_data]}
+                    bc_type[face_name] = outflow_bc
 
     return bc_map, bc_type
 

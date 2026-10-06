@@ -33,6 +33,7 @@ The module is used to extact centerlines from a surface mesh.
 """
 
 import os
+from collections import namedtuple
 from pathlib import Path
 import numpy as np
 
@@ -43,6 +44,7 @@ import vtk
 from vtk.util.numpy_support import vtk_to_numpy as v2n
 from vmtk import vtkvmtk
 
+from sv_rom_simulation.mesh import outlet_end_points
 from sv_rom_simulation.utils import SurfaceFileFormats, read_surface, read_polydata, write_polydata
 
 class Centerlines(object):
@@ -65,11 +67,13 @@ class Centerlines(object):
         Compute the centerlines for a closed surface.
         The centerline geometry is returned as a vtkPolyData object.
         """
-        inlet_face_id = params.inlet_face_id
         model_surface = read_surface(params.surface_model)
-        model_faces = get_surface_faces(model_surface)
-        face_centers = get_face_centers(model_faces)
-        #print(face_centers)
+        caps = get_caps(model_surface, params.boundary_surfaces_dir)
+        inlet_face_id = get_inlet_face_id(params, caps)
+        face_centers = {face_id: cap.center for face_id, cap in caps.items()}
+        self.logger.info("Inlet face %d, %d outlet faces: %s" % (
+            inlet_face_id, len(caps) - 1,
+            ", ".join(cap.name or str(face_id) for face_id, cap in caps.items() if face_id != inlet_face_id)))
 
         self.logger.info("Computing surface centerlines ...")
         centerlines = self.compute_centerlines(model_surface, face_centers, inlet_face_id)
@@ -88,7 +92,8 @@ class Centerlines(object):
         branch_splitting.Update()
         branch_centerlines = branch_splitting.GetCenterlines()
         self.logger.info("The branch splitting centerlines have been computed.")
-        self.geometry = branch_centerlines 
+        self.geometry = branch_centerlines
+        self.name_outlets(caps, inlet_face_id)
 
         write_polydata(params.centerlines_output_file, self.geometry)
 
@@ -145,6 +150,49 @@ class Centerlines(object):
         centerlines = centerlineFilter.GetOutput()
 
         return centerlines
+
+    def name_outlets(self, caps, inlet_face_id):
+        """
+        Name each outlet end of the centerlines after the cap it ends at.
+
+        Paired by position, one to one and closest first, rather than by the order the caps
+        were handed to VMTK in. The outlet names are matched to the boundary conditions by
+        list position (Mesh.terminal), and nothing ties the order the centerline ends come out
+        in to the order their seeds went in: a list that is off by one names every boundary
+        condition after its neighbour's vessel, and nothing downstream can tell -- the ids
+        are all valid and the names all real. Where a centerline end is is not open to that.
+
+        Left unnamed (and so to the outlet face names file, in centerline order, as before)
+        where the caps came without names.
+        """
+        outlets = {face_id: cap for face_id, cap in caps.items() if face_id != inlet_face_id}
+        ends = outlet_end_points(self.geometry)
+        if len(ends) != len(outlets):
+            raise RuntimeError("The centerlines have %d outlet ends and the surface %d outlet caps: a centerline "
+                               "did not reach every cap, or ran out through something that is not one." %
+                               (len(ends), len(outlets)))
+        if any(cap.name is None for cap in outlets.values()):
+            return
+
+        from scipy.optimize import linear_sum_assignment
+        face_ids = list(outlets)
+        end_points = np.array([self.geometry.GetPoint(int(point)) for _branch, point in ends])
+        centers = np.array([outlets[face_id].center for face_id in face_ids])
+        distances = np.linalg.norm(end_points[:, None, :] - centers[None, :, :], axis=-1)
+        rows, columns = linear_sum_assignment(distances)
+
+        names = [None] * len(ends)
+        for row, column in zip(rows, columns):
+            cap = outlets[face_ids[column]]
+            # A centerline ends on the surface point nearest its cap's center, so within the
+            # cap; one a cap's width away ended somewhere else and was paired by elimination.
+            if distances[row, column] > cap.diameter:
+                raise RuntimeError("The centerline end of branch %d is %.3g from the center of '%s', the nearest "
+                                   "cap left to pair it with, which is %.3g across." %
+                                   (ends[row][0], distances[row, column], cap.name, cap.diameter))
+            names[row] = cap.name
+        self.outlet_face_names = names
+        self.logger.info("Outlets in centerline order: %s" % ", ".join(names))
 
     def read(self, file_name):
         """
@@ -216,22 +264,98 @@ class Centerlines(object):
                 fp.write(name+"\n")
 
 
-def get_surface_faces(surface):
-    '''Get the faces from the surface mesh using the ModelFaceID data array.
+# A cap: the face id it carries on the surface, the name it goes by (None where only the
+# geometry said it was a cap), its center, and the diameter of the circle of its area.
+Cap = namedtuple('Cap', 'name center diameter')
+
+# Largest distance of a face from its own best-fit plane, as a fraction of the face's size,
+# below which the face is taken for a cap. A cap cut across a vessel and meshed comes out at
+# a few hundredths -- the mesher moves its interior points off the cut by a fraction of an
+# element -- and a wall, curving round the vessel, at a large fraction of its size.
+CAP_FLATNESS_TOLERANCE = 0.1
+
+
+def get_caps(surface, boundary_surfaces_dir=None):
+    '''The surface's caps by face id, named where the face files say what they are called.
+
+    The face files are what a mesh-complete folder's mesh-surfaces directory holds, and their
+    names are the SimVascular convention the rest of this package follows: a file whose name
+    starts with 'wall' is wall, anything else a cap, and the file's stem the face's name. That
+    is a statement about every face, so it is taken over the geometry wherever it is there.
+    Without them the caps are the faces that are flat.
     '''
-    face_ids = surface.GetCellData().GetArray('ModelFaceID')
-    face_ids_range = 2*[0]
-    face_ids.GetRange(face_ids_range, 0)
-    min_id = int(face_ids_range[0])
-    max_id = int(face_ids_range[1])
-    print(f'min_id {min_id}')
-    print(f'max_id {max_id}')
+    caps = caps_from_face_files(surface, boundary_surfaces_dir) if boundary_surfaces_dir else {}
+    if not caps:
+        caps = {face_id: Cap(None, get_polydata_centroid(face), equivalent_diameter(face))
+                for face_id, face in get_surface_faces(surface).items()}
+    if len(caps) < 2:
+        raise RuntimeError("Found %d cap(s) on the surface, and centerlines need an inlet and at least one "
+                           "outlet." % len(caps))
+    return caps
+
+
+def caps_from_face_files(surface, boundary_surfaces_dir):
+    '''The caps among the face files in a directory: {face id: Cap}, or {} if it holds none.
+
+    Only files carrying a single ModelFaceID that the surface also carries count, so that a
+    directory holding something else -- the default is the working directory -- reads as
+    holding no faces rather than as faces of this surface.
+    '''
+    surface_ids = set(np.unique(v2n(surface.GetCellData().GetArray('ModelFaceID'))).tolist())
+    caps = {}
+    for face_file in sorted(Path(boundary_surfaces_dir).iterdir()):
+        suffix = face_file.suffix.lower()[1:]
+        if suffix not in SurfaceFileFormats or face_file.name.lower().startswith('wall'):
+            continue
+        face = read_surface(str(face_file), suffix)
+        ids = face.GetCellData().GetArray('ModelFaceID')
+        if ids is None or face.GetNumberOfCells() == 0:
+            continue
+        face_ids = np.unique(v2n(ids)).tolist()
+        if len(face_ids) != 1 or face_ids[0] not in surface_ids:
+            continue
+        caps[int(face_ids[0])] = Cap(face_file.stem, get_polydata_centroid(face), equivalent_diameter(face))
+    return dict(sorted(caps.items()))
+
+
+def get_inlet_face_id(params, caps):
+    '''The inlet's face id: as given, or the id of the cap the inlet face file names.'''
+    if params.inlet_face_id is not None:
+        inlet_face_id = int(params.inlet_face_id)
+    elif params.inlet_face_input_file:
+        stem = Path(params.inlet_face_input_file).stem
+        named = [face_id for face_id, cap in caps.items() if cap.name == stem]
+        if not named:
+            raise RuntimeError("The inlet face '%s' is not among the caps: %s." %
+                               (stem, ", ".join(cap.name or str(face_id) for face_id, cap in caps.items())))
+        inlet_face_id = named[0]
+    else:
+        raise RuntimeError("No inlet face: give its face id or its face file.")
+    if inlet_face_id not in caps:
+        raise RuntimeError("Face %d is not a cap of the surface, so it cannot be the inlet. The caps are %s." %
+                           (inlet_face_id, ", ".join(str(face_id) for face_id in caps)))
+    return inlet_face_id
+
+
+def equivalent_diameter(face):
+    '''Diameter of the circle of the face's area.'''
+    properties = vtk.vtkMassProperties()
+    properties.SetInputData(face)
+    properties.Update()
+    return 2.0 * float(np.sqrt(properties.GetSurfaceArea() / np.pi))
+
+
+def get_surface_faces(surface):
+    '''Get the flat faces from the surface mesh using the ModelFaceID data array.
+    '''
+    face_ids = v2n(surface.GetCellData().GetArray('ModelFaceID'))
 
     ## Extract face geometry.
     #
+    # Over the ids the surface carries rather than every integer between the smallest and the
+    # largest: a gap in the numbering is an empty face, which has no plane to be flat in.
     faces = {}
-    for i in range(min_id, max_id+1):
-        print(f'--------- {i} ----------')
+    for i in np.unique(face_ids).tolist():
         threshold = vtk.vtkThreshold()
         threshold.SetInputData(surface)
         threshold.SetInputArrayToProcess(0,0,0,1,'ModelFaceID')
@@ -245,7 +369,7 @@ def get_surface_faces(surface):
         face = surfacer.GetOutput()
 
         if surface_is_flat(face):
-            faces[i] = face
+            faces[int(i)] = face
 
     return faces
 
@@ -263,27 +387,24 @@ def get_face_centers(model_faces):
     return face_centers
 
 def surface_is_flat(surface):
-    curvatures = vtk.vtkCurvatures()
-    curvatures.SetInputData(surface)
-    curvatures.SetCurvatureTypeToGaussian()
-    curvatures.Update()
-    output_pd = curvatures.GetOutput()
-    scalar_array = output_pd.GetPointData().GetArray("Gauss_Curvature")
-    scalar_range = output_pd.GetPointData().GetScalars().GetRange()
-    
-    is_flat = False
-    tolerance = 1e-5
-        
-    if abs(scalar_range[0]) < tolerance:
-        is_flat = True
-        
-    #if is_flat:
-    #  print('The surface is flat.')
-    #else:
-    #  print('The surface is curved.')
-        
-    return is_flat 
-        
+    '''Whether a face lies in a plane, to within CAP_FLATNESS_TOLERANCE of its own size.
+
+    Measured as distance from the best-fit plane rather than as Gaussian curvature. The
+    curvature of a meshed cap is not zero: its interior points sit a fraction of an element off
+    the cut, which reads as curvature of order 1e-3 per square unit at the smallest, and an
+    absolute tolerance of 1e-5 found no caps at all on a clinical mesh -- so no centerline
+    targets, and centerlines with no cells. A distance relative to the face's size does not
+    depend on the units or the resolution either.
+    '''
+    if surface.GetNumberOfPoints() < 3:
+        return False
+    points = v2n(surface.GetPoints().GetData()).astype(float)
+    centroid = points.mean(axis=0)
+    normal = np.linalg.svd(points - centroid, full_matrices=False)[2][-1]
+    deviation = np.abs((points - centroid) @ normal).max()
+    size = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
+    return bool(deviation <= CAP_FLATNESS_TOLERANCE * size)
+
 
 
 
