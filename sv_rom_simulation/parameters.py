@@ -56,7 +56,7 @@ class Parameters():
         CM = "cm"
 
     def __init__(self):
-        self.boundary_surfaces_dir = './'
+        self.boundary_surfaces_dir = ''
         self.output_directory = None
         self.centerlines_input_file = None
         self.centerlines_output_file = None

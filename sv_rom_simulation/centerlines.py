@@ -71,6 +71,7 @@ class Centerlines(object):
         caps = get_caps(model_surface, params.boundary_surfaces_dir)
         inlet_face_id = get_inlet_face_id(params, caps)
         face_centers = {face_id: cap.center for face_id, cap in caps.items()}
+
         self.logger.info("Inlet face %d, %d outlet faces: %s" % (
             inlet_face_id, len(caps) - 1,
             ", ".join(cap.name or str(face_id) for face_id, cap in caps.items() if face_id != inlet_face_id)))
@@ -350,6 +351,7 @@ def get_surface_faces(surface):
     '''
     face_ids = v2n(surface.GetCellData().GetArray('ModelFaceID'))
 
+
     ## Extract face geometry.
     #
     # Over the ids the surface carries rather than every integer between the smallest and the
@@ -387,27 +389,25 @@ def get_face_centers(model_faces):
     return face_centers
 
 def surface_is_flat(surface):
-    '''Whether a face lies in a plane, to within CAP_FLATNESS_TOLERANCE of its own size.
+    """
+    Determine if a face is flat. This is used to identify caps if no other
+    information is available.
+    """
+    curvatures = vtk.vtkCurvatures()
+    curvatures.SetInputData(surface)
+    curvatures.SetCurvatureTypeToGaussian()
+    curvatures.Update()
+    output_pd = curvatures.GetOutput()
+    scalar_array = output_pd.GetPointData().GetArray("Gauss_Curvature")
+    scalar_range = output_pd.GetPointData().GetScalars().GetRange()
 
-    Measured as distance from the best-fit plane rather than as Gaussian curvature. The
-    curvature of a meshed cap is not zero: its interior points sit a fraction of an element off
-    the cut, which reads as curvature of order 1e-3 per square unit at the smallest, and an
-    absolute tolerance of 1e-5 found no caps at all on a clinical mesh -- so no centerline
-    targets, and centerlines with no cells. A distance relative to the face's size does not
-    depend on the units or the resolution either.
-    '''
-    if surface.GetNumberOfPoints() < 3:
-        return False
-    points = v2n(surface.GetPoints().GetData()).astype(float)
-    centroid = points.mean(axis=0)
-    normal = np.linalg.svd(points - centroid, full_matrices=False)[2][-1]
-    deviation = np.abs((points - centroid) @ normal).max()
-    size = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
-    return bool(deviation <= CAP_FLATNESS_TOLERANCE * size)
+    is_flat = False
+    tolerance = 1e-5
 
+    if abs(scalar_range[0]) < tolerance:
+        is_flat = True
 
-
-
+    return is_flat
 
 def get_polydata_centroid(poly_data):
     """
